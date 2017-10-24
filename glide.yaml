@@ -7,4 +7,4 @@ import:
   - plugin
   - terraform
 - package: github.com/peterbale/go-phpipam
-  version: ^0.3.0
+  version: ^0.3.1
