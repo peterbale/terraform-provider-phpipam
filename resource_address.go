@@ -22,6 +22,7 @@ type AddressInformation struct {
 	Broadcast string
 	Gateway   string
 	BitMask   string
+	Index     string
 }
 
 func resourcePhpIPAMAddress() *schema.Resource {
@@ -59,6 +60,10 @@ func resourcePhpIPAMAddress() *schema.Resource {
 			"bitmask": &schema.Schema{
 				Type:     schema.TypeString,
 				Computed: true,
+			},
+			"index": &schema.Schema{
+				Type:     schema.TypeString,
+				Optional: true,
 			},
 		},
 	}
@@ -98,14 +103,34 @@ func (c *Client) findSubnetID(sectionID string, subnet string) (string, error) {
 	return subnetID, nil
 }
 
-func (c *Client) findExistingAddress(hostname string) (phpipam.AddressSearch, int, error) {
+func (c *Client) findExistingAddress(hostname string, index string) (string, error) {
+	var address string
 	var totalFoundAddresses int
 	addresses, err := c.PhpIPAMClient.GetAddressSearch(hostname)
 	if err != nil {
-		return addresses, totalFoundAddresses, err
+		return address, err
 	}
 	totalFoundAddresses = len(addresses.Data)
-	return addresses, totalFoundAddresses, nil
+	if totalFoundAddresses == 0 {
+		return address, nil
+	}
+	if len(index) > 0 {
+		totalFoundAddresses = 0
+		for _, i := range addresses.Data {
+			if i.Description == index {
+				totalFoundAddresses++
+				if totalFoundAddresses > 1 {
+					return address, errors.New("Multiple Indexed Addresses Found")
+				}
+				address = i.IP
+			}
+		}
+	} else if totalFoundAddresses > 1 {
+		return address, errors.New("Multiple Addresses Found")
+	} else {
+		address = addresses.Data[0].IP
+	}
+	return address, nil
 }
 
 func (c *Client) getAddressID(address string) (string, error) {
@@ -134,6 +159,20 @@ func (c *Client) getAddressInformation(addressID string) (*AddressInformation, e
 	} else {
 		return nil, nil
 	}
+	addressSearchData, err := c.PhpIPAMClient.GetAddressSearch(addressInformation.Hostname)
+	if err != nil {
+		return nil, err
+	}
+	if addressSearchData.Code == 200 {
+		for _, address := range addressSearchData.Data {
+			if address.ID == addressID {
+				_, err = strconv.Atoi(address.Description)
+				if err == nil {
+					addressInformation.Index = address.Description
+				}
+			}
+		}
+	}
 	subnetData, err := c.PhpIPAMClient.GetSubnet(subnetID)
 	if err != nil {
 		return nil, err
@@ -159,20 +198,6 @@ func (c *Client) getAddressInformation(addressID string) (*AddressInformation, e
 	return addressInformation, nil
 }
 
-func (c *Client) checkAddressLive(addressID string) (int, error) {
-	var pingStatusBool int
-	pingStatus, err := c.PhpIPAMClient.GetAddressPing(addressID)
-	if err != nil {
-		return pingStatusBool, err
-	}
-	if pingStatus.Code == 200 {
-		pingStatusBool = 1
-	} else {
-		pingStatusBool = 0
-	}
-	return pingStatusBool, nil
-}
-
 func checkAddressSubnet(existingSubnetID string, subnetID string) int {
 	var subnetMatchBool int
 	if existingSubnetID == subnetID {
@@ -183,8 +208,8 @@ func checkAddressSubnet(existingSubnetID string, subnetID string) int {
 	return subnetMatchBool
 }
 
-func (c *Client) allocateNewAddress(subnetID string, hostname string) (phpipam.AddressFirstFree, error) {
-	newAddress, err := c.PhpIPAMClient.CreateAddressFirstFree(subnetID, hostname, "terraform")
+func (c *Client) allocateNewAddress(subnetID string, hostname string, index string) (phpipam.AddressFirstFree, error) {
+	newAddress, err := c.PhpIPAMClient.CreateAddressFirstFree(subnetID, hostname, "terraform", index)
 	if err != nil {
 		return newAddress, err
 	}
@@ -199,7 +224,7 @@ func (c *Client) deleteExistingAddress(addressID string) (phpipam.AddressDelete,
 	return deleteAddress, nil
 }
 
-func (c *Client) create(section string, subnet string, hostname string, update bool) (string, error) {
+func (c *Client) create(section string, subnet string, hostname string, update bool, index string) (string, error) {
 	addonLock.Lock()
 	defer addonLock.Unlock()
 
@@ -212,13 +237,13 @@ func (c *Client) create(section string, subnet string, hostname string, update b
 	if err != nil {
 		return addressID, fmt.Errorf("Error Getting Subnet ID: %s", err)
 	}
-	addresses, totalFoundAddresses, err := c.findExistingAddress(hostname)
+	address, err := c.findExistingAddress(hostname, index)
 	if err != nil {
 		return addressID, fmt.Errorf("Error Finding Existing Addresses: %s", err)
 	}
-	if totalFoundAddresses == 0 || (totalFoundAddresses == 1 && update) {
+	if len(address) == 0 || update {
 		log.Printf("[DEBUG] New Address Section ID: %#v, Subnet ID: %#v", sectionID, subnetID)
-		newAddress, err := c.allocateNewAddress(subnetID, hostname)
+		newAddress, err := c.allocateNewAddress(subnetID, hostname, index)
 		if err != nil {
 			return addressID, fmt.Errorf("Error Allocating New Address: %s", err)
 		}
@@ -228,35 +253,19 @@ func (c *Client) create(section string, subnet string, hostname string, update b
 			return addressID, fmt.Errorf("Error Getting Created Address ID: %s", newAddress.IP)
 		}
 		log.Printf("[INFO] New Address Allocated: %s", newAddress.IP)
-	} else if totalFoundAddresses == 1 && !update {
-		log.Printf("[DEBUG] Existing Address Section ID: %#v, Subnet ID: %#v", sectionID, subnetID)
-		log.Printf("[DEBUG] Existing Address IP: %#v", addresses.Data[0].IP)
-		addressID, err = c.getAddressID(addresses.Data[0].IP)
-		if err != nil {
-			return addressID, fmt.Errorf("Error Getting Created Address ID: %s", addresses.Data[0])
-		}
-		addressState, err := c.checkAddressLive(addressID)
-		if err != nil {
-			return addressID, fmt.Errorf("Address Liveliness Check Failed: %s", err)
-		} else if addressState != 0 {
-			return addressID, fmt.Errorf("Existing Address Host is Still Live")
-		}
-		log.Printf("[INFO] New Address Allocated: %s", addresses.Data[0].IP)
 	} else {
-		return addressID, fmt.Errorf("Error Address Already Allocated, Total Found Addresses: %s", strconv.Itoa(totalFoundAddresses))
+		log.Printf("[DEBUG] Existing Address Section ID: %#v, Subnet ID: %#v", sectionID, subnetID)
+		log.Printf("[DEBUG] Existing Address IP: %#v", address)
+		addressID, err = c.getAddressID(address)
+		if err != nil {
+			return addressID, fmt.Errorf("Error Getting Created Address ID: %s", address)
+		}
+		log.Printf("[INFO] New Address Allocated: %s", address)
 	}
 	return addressID, nil
 }
 
 func (c *Client) delete(addressID string, update bool) error {
-	if !update {
-		addressState, err := c.checkAddressLive(addressID)
-		if err != nil {
-			return fmt.Errorf("Address Liveliness Check Failed: %s", err)
-		} else if addressState != 0 {
-			return fmt.Errorf("Address Host is Still Live")
-		}
-	}
 	_, err := c.deleteExistingAddress(addressID)
 	if err != nil {
 		return fmt.Errorf("Delete Address Failed: %s", err)
@@ -269,8 +278,9 @@ func resourcePhpIPAMAddressCreate(d *schema.ResourceData, m interface{}) error {
 	section := d.Get("section").(string)
 	subnet := d.Get("subnet").(string)
 	hostname := d.Get("hostname").(string)
+	index := d.Get("index").(string)
 	client := m.(*Client)
-	addressID, err := client.create(section, subnet, hostname, false)
+	addressID, err := client.create(section, subnet, hostname, false, index)
 	if err != nil {
 		return err
 	}
@@ -292,6 +302,7 @@ func resourcePhpIPAMAddressRead(d *schema.ResourceData, m interface{}) error {
 	d.Set("broadcast", addressInformation.Broadcast)
 	d.Set("gateway", addressInformation.Gateway)
 	d.Set("bitmask", addressInformation.BitMask)
+	d.Set("index", addressInformation.Index)
 	return nil
 }
 
@@ -299,6 +310,7 @@ func resourcePhpIPAMAddressrUpdate(d *schema.ResourceData, m interface{}) error 
 	section := d.Get("section").(string)
 	subnet := d.Get("subnet").(string)
 	hostname := d.Get("hostname").(string)
+	index := d.Get("index").(string)
 	client := m.(*Client)
 	addressID := d.Id()
 	var err error
@@ -309,7 +321,7 @@ func resourcePhpIPAMAddressrUpdate(d *schema.ResourceData, m interface{}) error 
 		}
 		log.Printf("[INFO] Address Updated: %s", hostname)
 	} else {
-		newAddressID, err := client.create(section, subnet, hostname, true)
+		newAddressID, err := client.create(section, subnet, hostname, true, index)
 		if err != nil {
 			return err
 		}
