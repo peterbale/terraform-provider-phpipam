@@ -65,11 +65,6 @@ func resourcePhpIPAMAddress() *schema.Resource {
 				Type:     schema.TypeString,
 				Optional: true,
 			},
-			"ping_check": &schema.Schema{
-				Type:     schema.TypeBool,
-				Optional: true,
-				Default:  true,
-			},
 		},
 	}
 }
@@ -203,20 +198,6 @@ func (c *Client) getAddressInformation(addressID string) (*AddressInformation, e
 	return addressInformation, nil
 }
 
-func (c *Client) checkAddressLive(addressID string) (int, error) {
-	var pingStatusBool int
-	pingStatus, err := c.PhpIPAMClient.GetAddressPing(addressID)
-	if err != nil {
-		return pingStatusBool, err
-	}
-	if pingStatus.Code == 200 {
-		pingStatusBool = 1
-	} else {
-		pingStatusBool = 0
-	}
-	return pingStatusBool, nil
-}
-
 func checkAddressSubnet(existingSubnetID string, subnetID string) int {
 	var subnetMatchBool int
 	if existingSubnetID == subnetID {
@@ -243,7 +224,7 @@ func (c *Client) deleteExistingAddress(addressID string) (phpipam.AddressDelete,
 	return deleteAddress, nil
 }
 
-func (c *Client) create(section string, subnet string, hostname string, update bool, index string, pingCheck bool) (string, error) {
+func (c *Client) create(section string, subnet string, hostname string, update bool, index string) (string, error) {
 	addonLock.Lock()
 	defer addonLock.Unlock()
 
@@ -279,28 +260,12 @@ func (c *Client) create(section string, subnet string, hostname string, update b
 		if err != nil {
 			return addressID, fmt.Errorf("Error Getting Created Address ID: %s", address)
 		}
-		if pingCheck {
-			addressState, err := c.checkAddressLive(addressID)
-			if err != nil {
-				return addressID, fmt.Errorf("Address Liveliness Check Failed: %s", err)
-			} else if addressState != 0 {
-				return addressID, fmt.Errorf("Existing Address Host is Still Live")
-			}
-		}
 		log.Printf("[INFO] New Address Allocated: %s", address)
 	}
 	return addressID, nil
 }
 
-func (c *Client) delete(addressID string, update bool, pingCheck bool) error {
-	if !update || pingCheck {
-		addressState, err := c.checkAddressLive(addressID)
-		if err != nil {
-			return fmt.Errorf("Address Liveliness Check Failed: %s", err)
-		} else if addressState != 0 {
-			return fmt.Errorf("Address Host is Still Live")
-		}
-	}
+func (c *Client) delete(addressID string, update bool) error {
 	_, err := c.deleteExistingAddress(addressID)
 	if err != nil {
 		return fmt.Errorf("Delete Address Failed: %s", err)
@@ -314,9 +279,8 @@ func resourcePhpIPAMAddressCreate(d *schema.ResourceData, m interface{}) error {
 	subnet := d.Get("subnet").(string)
 	hostname := d.Get("hostname").(string)
 	index := d.Get("index").(string)
-	pingCheck := d.Get("ping_check").(bool)
 	client := m.(*Client)
-	addressID, err := client.create(section, subnet, hostname, false, index, pingCheck)
+	addressID, err := client.create(section, subnet, hostname, false, index)
 	if err != nil {
 		return err
 	}
@@ -347,7 +311,6 @@ func resourcePhpIPAMAddressrUpdate(d *schema.ResourceData, m interface{}) error 
 	subnet := d.Get("subnet").(string)
 	hostname := d.Get("hostname").(string)
 	index := d.Get("index").(string)
-	pingCheck := d.Get("ping_check").(bool)
 	client := m.(*Client)
 	addressID := d.Id()
 	var err error
@@ -358,11 +321,11 @@ func resourcePhpIPAMAddressrUpdate(d *schema.ResourceData, m interface{}) error 
 		}
 		log.Printf("[INFO] Address Updated: %s", hostname)
 	} else {
-		newAddressID, err := client.create(section, subnet, hostname, true, index, pingCheck)
+		newAddressID, err := client.create(section, subnet, hostname, true, index)
 		if err != nil {
 			return err
 		}
-		err = client.delete(addressID, true, pingCheck)
+		err = client.delete(addressID, true)
 		if err != nil {
 			return err
 		}
@@ -372,8 +335,7 @@ func resourcePhpIPAMAddressrUpdate(d *schema.ResourceData, m interface{}) error 
 }
 
 func resourcePhpIPAMAddressDelete(d *schema.ResourceData, m interface{}) error {
-	pingCheck := d.Get("ping_check").(bool)
 	client := m.(*Client)
-	err := client.delete(d.Id(), false, pingCheck)
+	err := client.delete(d.Id(), false)
 	return err
 }
